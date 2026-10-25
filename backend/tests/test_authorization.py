@@ -139,7 +139,7 @@ def test_viewer_cannot_request_certificate(setup_api):
     client, actors = setup_api
     actors["user"] = actors["viewer"]
 
-    response = client.get(f"/api/v1/evidence/{actors['evidence'].id}/certificate")
+    response = client.post(f"/api/v1/evidence/{actors['evidence'].id}/certificate")
 
     assert response.status_code == 403
 
