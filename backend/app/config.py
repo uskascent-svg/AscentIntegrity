@@ -11,5 +11,5 @@ class Settings(BaseSettings):
     blockchain_rpc_url: str = ""
     blockchain_contract_address: str = ""
     blockchain_private_key: str = ""
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 settings = Settings()
