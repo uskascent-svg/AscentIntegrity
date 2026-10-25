@@ -10,15 +10,17 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.blockchain import (
     anchor_digest,
     configured as blockchain_configured,
     verify_digest,
 )
+from app.certificates import sign_payload, verify_payload_signature
 from app.config import settings
 from app.db import get_db
-from app.models import AuditEvent, BlockchainAnchor, Evidence, EvidenceVersion, User, UserRole
+from app.models import AuditEvent, BlockchainAnchor, Evidence, EvidenceVersion, IntegrityCertificate, User, UserRole
 from app.security import (
     create_access_token,
     get_current_user,
@@ -345,8 +347,51 @@ def verify(
     }
 
 
+def certificate_out(certificate: IntegrityCertificate) -> dict:
+    payload = json.loads(certificate.payload_json)
+    signature_valid = verify_payload_signature(
+        payload,
+        certificate.signature,
+        certificate.public_key_pem,
+    )
+    return {
+        "payload": payload,
+        "signature": certificate.signature,
+        "signature_algorithm": certificate.signature_algorithm,
+        "signing_key_id": certificate.signing_key_id,
+        "public_key_pem": certificate.public_key_pem,
+        "signature_valid": signature_valid,
+        "key_trust_note": "The signature verifies against the included public key. Independently trust the issuer by validating the key fingerprint through a trusted channel.",
+        "revocation": {
+            "status": certificate.status,
+            "revoked_at": certificate.revoked_at,
+            "reason": certificate.revocation_reason,
+        },
+    }
+
+
 @app.get("/api/v1/evidence/{evidence_id}/certificate")
-def certificate(
+def get_certificate(
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = get_item(evidence_id, db, user)
+    certificate = db.scalar(
+        select(IntegrityCertificate)
+        .where(
+            IntegrityCertificate.evidence_id == item.id,
+            IntegrityCertificate.sha256 == item.sha256,
+        )
+        .order_by(IntegrityCertificate.created_at.desc())
+    )
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="No certificate has been issued for this evidence version")
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/evidence/{evidence_id}/certificate", status_code=201)
+def issue_certificate(
     evidence_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -359,35 +404,175 @@ def certificate(
 
     if observed != item.sha256:
         raise HTTPException(status_code=409, detail="Certificate unavailable: integrity verification failed")
-    if chain != "confirmed":
+    if chain != "confirmed" or anchor is None:
         raise HTTPException(
             status_code=409,
             detail=f"Certificate unavailable: blockchain verification status is {chain}",
         )
 
-    now = datetime.now(timezone.utc)
+    existing = db.scalar(
+        select(IntegrityCertificate).where(
+            IntegrityCertificate.evidence_id == item.id,
+            IntegrityCertificate.sha256 == item.sha256,
+        )
+    )
+    if existing is not None:
+        if existing.status == "REVOKED":
+            raise HTTPException(status_code=409, detail="This certificate was revoked; a new evidence version is required")
+        return certificate_out(existing)
+
+    issued_at = datetime.now(timezone.utc)
     certificate_id = str(uuid.uuid4())
+    payload = {
+        "certificate_id": certificate_id,
+        "schema_version": 1,
+        "product": "AscentIntegrity",
+        "certificate_type": "document_integrity",
+        "evidence_id": item.id,
+        "sha256": item.sha256,
+        "issuer_id": user.id,
+        "issued_at": issued_at.isoformat(),
+        "status": "ISSUED",
+        "blockchain": {
+            "status": "confirmed",
+            "transaction_hash": anchor.tx_hash,
+            "block_number": anchor.block_number,
+            "digest": anchor.sha256,
+        },
+        "statement": (
+            "Defined document-integrity checks passed at issuance time. "
+            "This certificate does not prove factual truth, authorship, lawful collection, "
+            "institutional legitimacy, or legal admissibility."
+        ),
+    }
+
+    try:
+        signature, public_key_pem, key_id = sign_payload(payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Certificate signing is unavailable. Configure a valid Ed25519 signing key.",
+        ) from exc
+
+    if not verify_payload_signature(payload, signature, public_key_pem):
+        raise HTTPException(status_code=500, detail="Certificate signature self-check failed")
+
+    certificate = IntegrityCertificate(
+        id=certificate_id,
+        evidence_id=item.id,
+        sha256=item.sha256,
+        issuer_id=user.id,
+        schema_version=1,
+        payload_json=json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        signature=signature,
+        signature_algorithm="Ed25519",
+        signing_key_id=key_id,
+        public_key_pem=public_key_pem,
+        status="ISSUED",
+        created_at=issued_at,
+    )
+    db.add(certificate)
     record(
         db,
         user.id,
         "certificate.issued",
-        "evidence",
-        item.id,
-        {"sha256": item.sha256, "certificate_id": certificate_id},
+        "certificate",
+        certificate_id,
+        {"evidence_id": item.id, "sha256": item.sha256, "signing_key_id": key_id},
+    )
+    try:
+        db.commit()
+        db.refresh(certificate)
+    except IntegrityError:
+        db.rollback()
+        # A concurrent retry may have issued the same evidence/digest certificate.
+        existing = db.scalar(
+            select(IntegrityCertificate).where(
+                IntegrityCertificate.evidence_id == item.id,
+                IntegrityCertificate.sha256 == item.sha256,
+            )
+        )
+        if existing is None:
+            raise HTTPException(status_code=409, detail="Certificate issuance conflicted; retry safely")
+        return certificate_out(existing)
+    return certificate_out(certificate)
+
+
+@app.get("/api/v1/public/certificates/{certificate_id}")
+def get_public_certificate(certificate_id: str, db: Session = Depends(get_db)):
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/public/certificates/{certificate_id}/verify")
+async def verify_public_certificate(
+    certificate_id: str,
+    file: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+):
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+
+    payload = json.loads(certificate.payload_json)
+    signature_valid = verify_payload_signature(
+        payload,
+        certificate.signature,
+        certificate.public_key_pem,
+    )
+    item = db.get(Evidence, certificate.evidence_id)
+    observed_stored_hash = current_stored_hash(item) if item is not None else None
+    anchor = latest_anchor(db, certificate.evidence_id) if item is not None else None
+    chain = chain_status(item, anchor) if item is not None else "unavailable"
+
+    submitted_hash = None
+    if file is not None:
+        data = await file.read(settings.max_upload_bytes + 1)
+        await file.close()
+        if len(data) > settings.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty files are not accepted")
+        submitted_hash = hashlib.sha256(data).hexdigest()
+
+    if certificate.status == "REVOKED":
+        status = "REVOKED"
+    elif not signature_valid:
+        status = "INVALID"
+    elif observed_stored_hash != certificate.sha256:
+        status = "UNVERIFIABLE" if observed_stored_hash is None else "INVALID"
+    elif submitted_hash is not None and submitted_hash != certificate.sha256:
+        status = "DOCUMENT_MISMATCH"
+    elif chain != "confirmed":
+        status = "PENDING" if chain == "not_anchored" else "UNVERIFIABLE"
+    else:
+        status = "VERIFIED"
+
+    record(
+        db,
+        None,
+        "certificate.public_verification",
+        "certificate",
+        certificate.id,
+        {"status": status, "document_supplied": submitted_hash is not None},
     )
     db.commit()
     return {
-        "certificate_id": certificate_id,
-        "evidence_id": item.id,
-        "sha256": item.sha256,
-        "issued_at": now,
-        "status": "VERIFIED",
-        "statement": "Integrity checks passed for this evidence version at issuance time. This is not factual-truth certification.",
-        "checks": {
-            "sha256": "passed",
-            "stored_object": "matched",
-            "blockchain_anchor": "confirmed",
-        },
+        "certificate_id": certificate.id,
+        "status": status,
+        "signature_valid": signature_valid,
+        "stored_document_integrity": "matched" if observed_stored_hash == certificate.sha256 else "unavailable_or_mismatched",
+        "blockchain_status": chain,
+        "submitted_document_match": (
+            submitted_hash == certificate.sha256 if submitted_hash is not None else None
+        ),
+        "statement": (
+            "VERIFIED means the certificate signature, stored evidence digest, and required blockchain anchor passed. "
+            "A submitted document is compared only when one is provided. This result does not establish factual truth "
+            "or legal validity. Trust the issuer key through a separate trusted channel."
+        ),
     }
 
 
