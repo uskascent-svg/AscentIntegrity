@@ -1,6 +1,6 @@
 import enum, uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, ForeignKey, Text, Enum, BigInteger, Boolean
+from sqlalchemy import String, DateTime, ForeignKey, Text, Enum, BigInteger, Boolean, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
 def utcnow(): return datetime.now(timezone.utc)
@@ -56,3 +56,25 @@ class BlockchainAnchor(Base):
     tx_hash: Mapped[str|None]=mapped_column(String(80),nullable=True)
     block_number: Mapped[int|None]=mapped_column(nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=utcnow)
+
+
+class IntegrityCertificate(Base):
+    __tablename__ = "integrity_certificates"
+    __table_args__ = (
+        UniqueConstraint("evidence_id", "sha256", name="uq_certificate_evidence_digest"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("evidence.id"), index=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    issuer_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    schema_version: Mapped[int] = mapped_column(default=1)
+    payload_json: Mapped[str] = mapped_column(Text)
+    signature: Mapped[str] = mapped_column(Text)
+    signature_algorithm: Mapped[str] = mapped_column(String(32), default="Ed25519")
+    signing_key_id: Mapped[str] = mapped_column(String(100))
+    public_key_pem: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="ISSUED", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revocation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
