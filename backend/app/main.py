@@ -183,8 +183,10 @@ async def upload(
     root.mkdir(parents=True, exist_ok=True)
     storage_path = root / key
 
+    storage_created = False
     try:
         with storage_path.open("xb") as output:
+            storage_created = True
             output.write(data)
         item = Evidence(
             case_reference=case_reference,
@@ -220,7 +222,8 @@ async def upload(
         return evidence_out(item)
     except Exception:
         db.rollback()
-        storage_path.unlink(missing_ok=True)
+        if storage_created:
+            storage_path.unlink(missing_ok=True)
         raise
     finally:
         await file.close()
