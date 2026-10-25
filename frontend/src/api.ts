@@ -1,0 +1,4 @@
+const API=import.meta.env.VITE_API_URL??'http://127.0.0.1:8000';
+export type Evidence={id:string;case_reference:string;filename:string;media_type:string;byte_size:number;sha256:string;status:string;created_at:string};
+export async function api<T>(path:string,token:string,init:RequestInit={}):Promise<T>{const headers=new Headers(init.headers);headers.set('Authorization',`Bearer ${token}`);const r=await fetch(`${API}${path}`,{...init,headers});if(!r.ok){const b=await r.json().catch(()=>({detail:r.statusText}));throw new Error(b.detail??`HTTP ${r.status}`)}return r.json() as Promise<T>}
+export async function login(email:string,password:string){const body=new URLSearchParams({username:email,password});const r=await fetch(`${API}/api/v1/auth/token`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw new Error((await r.json()).detail??'Login failed');return r.json() as Promise<{access_token:string;token_type:string}>}
