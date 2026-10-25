@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
@@ -397,6 +397,7 @@ def get_certificate(
 @app.post("/api/v1/evidence/{evidence_id}/certificate", status_code=201)
 def issue_certificate(
     evidence_id: str,
+    response: Response,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -423,6 +424,7 @@ def issue_certificate(
     if existing is not None:
         if existing.status == "REVOKED":
             raise HTTPException(status_code=409, detail="This certificate was revoked; a new evidence version is required")
+        response.status_code = 200
         return certificate_out(existing)
 
     issued_at = datetime.now(timezone.utc)
@@ -498,6 +500,7 @@ def issue_certificate(
         )
         if existing is None:
             raise HTTPException(status_code=409, detail="Certificate issuance conflicted; retry safely")
+        response.status_code = 200
         return certificate_out(existing)
     return certificate_out(certificate)
 
