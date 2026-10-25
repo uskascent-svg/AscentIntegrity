@@ -10,6 +10,7 @@ from app.config import settings
 from app.db import get_db
 from app.models import User, UserRole, Evidence, EvidenceVersion, AuditEvent, BlockchainAnchor
 from app.security import hash_password, verify_password, create_access_token, get_current_user
+from app.blockchain import configured as blockchain_configured, anchor_digest, verify_digest
 from pydantic import BaseModel, EmailStr
 app=FastAPI(title="AscentIntegrity API",version="0.1.0",description="Evidence integrity verification, not factual-truth certification.")
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(",")],allow_credentials=True,allow_methods=["GET","POST","OPTIONS"],allow_headers=["Authorization","Content-Type"])
@@ -62,14 +63,37 @@ def get_item(eid,db):
 @app.get("/api/v1/evidence/{evidence_id}")
 def get_evidence(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
     return evidence_out(get_item(evidence_id,db))
+@app.post("/api/v1/evidence/{evidence_id}/anchor")
+def anchor_evidence(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
+    item=get_item(evidence_id,db)
+    if not blockchain_configured():
+        raise HTTPException(503,"Blockchain is not configured. Set RPC URL, deployed contract address and signing key.")
+    existing=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id,BlockchainAnchor.status=="confirmed"))
+    if existing:
+        raise HTTPException(409,"This evidence already has a confirmed anchor; create a new evidence version to anchor a new digest.")
+    try:
+        tx_hash,block_number,confirmed=anchor_digest(item.id,item.sha256)
+        if not confirmed: raise RuntimeError("On-chain read-back verification did not match")
+    except Exception as exc:
+        raise HTTPException(502,"Blockchain anchoring failed; no confirmed anchor was recorded.") from exc
+    anchor=BlockchainAnchor(evidence_id=item.id,sha256=item.sha256,status="confirmed",tx_hash=tx_hash,block_number=block_number)
+    db.add(anchor)
+    record(db,user.id,"evidence.blockchain_anchored","evidence",item.id,{"tx_hash":tx_hash,"block_number":block_number,"sha256":item.sha256})
+    db.commit()
+    return {"evidence_id":item.id,"sha256":item.sha256,"status":"confirmed","tx_hash":tx_hash,"block_number":block_number,"statement":"The configured chain accepted this digest. This does not prove factual truth or lawful provenance."}
 @app.post("/api/v1/evidence/{evidence_id}/verify")
 def verify(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
     item=get_item(evidence_id,db);path=Path(settings.storage_root).resolve()/item.storage_key
     observed=hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
     integrity="VERIFIED" if observed==item.sha256 else "FAILED"
     anchor=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id).order_by(BlockchainAnchor.created_at.desc()))
-    chain=anchor.status if anchor else "not_configured"
-    cert="VERIFIED" if integrity=="VERIFIED" and chain=="confirmed" else ("FAILED" if integrity=="FAILED" else "INCOMPLETE")
+    chain="not_configured"
+    if blockchain_configured() and anchor:
+        try:
+            chain="confirmed" if verify_digest(item.id,anchor.sha256) and anchor.sha256==item.sha256 else "failed"
+        except Exception:
+            chain="unavailable"
+    cert="VERIFIED" if integrity=="VERIFIED" and chain=="confirmed" else ("FAILED" if integrity=="FAILED" or chain=="failed" else "INCOMPLETE")
     record(db,user.id,"evidence.verified","evidence",item.id,{"integrity":integrity,"blockchain":chain});db.commit()
     return {"evidence_id":item.id,"recorded_sha256":item.sha256,"observed_sha256":observed,"integrity_status":integrity,"blockchain_status":chain,"certificate_status":cert,"statement":"Byte-level integrity checks do not establish factual truth, authorship, lawful collection, or admissibility."}
 @app.get("/api/v1/evidence/{evidence_id}/certificate")
@@ -77,9 +101,14 @@ def certificate(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get
     item=get_item(evidence_id,db);path=Path(settings.storage_root).resolve()/item.storage_key
     observed=hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
     anchor=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id).order_by(BlockchainAnchor.created_at.desc()))
-    chain=anchor.status if anchor else "not_configured"
+    chain="not_configured"
+    if blockchain_configured() and anchor:
+        try:
+            chain="confirmed" if verify_digest(item.id,anchor.sha256) and anchor.sha256==item.sha256 else "failed"
+        except Exception:
+            chain="unavailable"
     if observed!=item.sha256: raise HTTPException(409,"Certificate unavailable: integrity verification failed")
-    if chain!="confirmed": raise HTTPException(409,"Certificate unavailable: blockchain anchor is not confirmed")
+    if chain!="confirmed": raise HTTPException(409,f"Certificate unavailable: blockchain verification status is {chain}")
     now=datetime.now(timezone.utc);cid=str(uuid.uuid4())
     record(db,user.id,"certificate.issued","evidence",item.id,{"sha256":item.sha256});db.commit()
     return {"certificate_id":cid,"evidence_id":item.id,"sha256":item.sha256,"issued_at":now,"status":"VERIFIED","statement":"Integrity checks passed for this evidence version at issuance time. This is not factual-truth certification.","checks":{"sha256":"passed","stored_object":"matched","blockchain_anchor":"confirmed"}}
