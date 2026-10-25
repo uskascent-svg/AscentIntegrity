@@ -47,6 +47,10 @@ class RegisterIn(BaseModel):
     password: str
 
 
+class RevokeCertificateIn(BaseModel):
+    reason: str
+
+
 def record(db: Session, actor: str | None, action: str, kind: str, resource_id: str | None, detail=None):
     db.add(
         AuditEvent(
@@ -495,6 +499,43 @@ def issue_certificate(
         if existing is None:
             raise HTTPException(status_code=409, detail="Certificate issuance conflicted; retry safely")
         return certificate_out(existing)
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/certificates/{certificate_id}/revoke")
+def revoke_certificate(
+    certificate_id: str,
+    payload: RevokeCertificateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_writer(user)
+    reason = payload.reason.strip()
+    if not reason or len(reason) > 500:
+        raise HTTPException(status_code=422, detail="Revocation reason must be 1-500 characters")
+
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    item = get_item(certificate.evidence_id, db, user)
+    if certificate.issuer_id != user.id and user.role != UserRole.admin:
+        raise HTTPException(status_code=403, detail="Only the issuing user or an administrator can revoke this certificate")
+    if certificate.status == "REVOKED":
+        return certificate_out(certificate)
+
+    certificate.status = "REVOKED"
+    certificate.revoked_at = datetime.now(timezone.utc)
+    certificate.revocation_reason = reason
+    record(
+        db,
+        user.id,
+        "certificate.revoked",
+        "certificate",
+        certificate.id,
+        {"evidence_id": item.id, "reason": reason},
+    )
+    db.commit()
+    db.refresh(certificate)
     return certificate_out(certificate)
 
 
