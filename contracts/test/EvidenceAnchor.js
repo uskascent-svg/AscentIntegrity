@@ -1,0 +1,2 @@
+const{expect}=require("chai");const{ethers}=require("hardhat");
+describe("EvidenceAnchor",function(){it("anchors digest and detects mismatch",async function(){const C=await ethers.getContractFactory("EvidenceAnchor");const c=await C.deploy();const id=ethers.keccak256(ethers.toUtf8Bytes("synthetic-evidence"));const d=ethers.keccak256(ethers.toUtf8Bytes("digest"));await c.anchor(id,d);expect(await c.verify(id,d)).to.equal(true);expect(await c.verify(id,ethers.keccak256(ethers.toUtf8Bytes("changed")))).to.equal(false);});});
