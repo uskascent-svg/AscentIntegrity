@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
-from app.models import Evidence, User, UserRole
+from app.models import BlockchainAnchor, Evidence, User, UserRole
 from app.security import get_current_user
 
 main_module = importlib.import_module("app.main")
@@ -79,6 +79,7 @@ def setup_api(tmp_path, monkeypatch):
             viewer=viewer,
             evidence=evidence,
             other_evidence=other_evidence,
+            session_factory=TestingSession,
         )
 
     client = TestClient(app)
@@ -141,3 +142,65 @@ def test_viewer_cannot_request_certificate(setup_api):
     response = client.get(f"/api/v1/evidence/{actors['evidence'].id}/certificate")
 
     assert response.status_code == 403
+
+
+
+def test_signed_certificate_is_persistent_and_public_verification_detects_changes(setup_api, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from app.config import settings
+
+    client, actors = setup_api
+    actors["user"] = actors["owner"]
+    private_key = Ed25519PrivateKey.generate()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+    monkeypatch.setattr(settings, "certificate_signing_private_key", private_pem)
+    monkeypatch.setattr(settings, "certificate_signing_key_id", "test-key-1")
+    monkeypatch.setattr(main_module, "blockchain_configured", lambda: True)
+    monkeypatch.setattr(main_module, "verify_digest", lambda evidence_id, digest: True)
+
+    with actors["session_factory"]() as db:
+        db.add(
+            BlockchainAnchor(
+                evidence_id=actors["evidence"].id,
+                sha256=actors["evidence"].sha256,
+                status="confirmed",
+                tx_hash="0x" + "1" * 64,
+                block_number=123,
+            )
+        )
+        db.commit()
+
+    issue_path = f"/api/v1/evidence/{actors['evidence'].id}/certificate"
+    first = client.post(issue_path)
+    second = client.post(issue_path)
+    assert first.status_code == 201
+    assert first.json()["signature_valid"] is True
+    assert second.status_code == 200
+    assert second.json()["payload"]["certificate_id"] == first.json()["payload"]["certificate_id"]
+
+    certificate_id = first.json()["payload"]["certificate_id"]
+    verified = client.post(f"/api/v1/public/certificates/{certificate_id}/verify")
+    assert verified.status_code == 200
+    assert verified.json()["status"] == "VERIFIED"
+    assert verified.json()["submitted_document_match"] is None
+
+    mismatch = client.post(
+        f"/api/v1/public/certificates/{certificate_id}/verify",
+        files={"file": ("changed.txt", b"modified bytes", "text/plain")},
+    )
+    assert mismatch.status_code == 200
+    assert mismatch.json()["status"] == "DOCUMENT_MISMATCH"
+
+    revoked = client.post(
+        f"/api/v1/certificates/{certificate_id}/revoke",
+        json={"reason": "Synthetic test revocation"},
+    )
+    assert revoked.status_code == 200
+    after_revoke = client.post(f"/api/v1/public/certificates/{certificate_id}/verify")
+    assert after_revoke.json()["status"] == "REVOKED"
