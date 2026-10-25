@@ -6,7 +6,6 @@ branch_labels=None
 depends_on=None
 def upgrade():
     role=sa.Enum("admin","analyst","viewer",name="userrole")
-    role.create(op.get_bind(),checkfirst=True)
     op.create_table("users",sa.Column("id",sa.String(36),primary_key=True),sa.Column("email",sa.String(320),nullable=False,unique=True),sa.Column("password_hash",sa.String(255),nullable=False),sa.Column("role",role,nullable=False),sa.Column("is_active",sa.Boolean(),nullable=False),sa.Column("created_at",sa.DateTime(timezone=True),nullable=False))
     op.create_index("ix_users_email","users",["email"],unique=True)
     op.create_table("evidence",sa.Column("id",sa.String(36),primary_key=True),sa.Column("case_reference",sa.String(100),nullable=False),sa.Column("filename",sa.String(255),nullable=False),sa.Column("media_type",sa.String(150),nullable=False),sa.Column("byte_size",sa.BigInteger(),nullable=False),sa.Column("sha256",sa.String(64),nullable=False),sa.Column("storage_key",sa.String(80),nullable=False,unique=True),sa.Column("uploaded_by",sa.String(36),sa.ForeignKey("users.id"),nullable=False),sa.Column("created_at",sa.DateTime(timezone=True),nullable=False),sa.Column("status",sa.String(24),nullable=False))

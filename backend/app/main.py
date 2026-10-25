@@ -1,118 +1,646 @@
-import hashlib, json, uuid
-from pathlib import Path
+import hashlib
+import json
+import uuid
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+
+from app.blockchain import (
+    anchor_digest,
+    configured as blockchain_configured,
+    verify_digest,
+)
+from app.certificates import sign_payload, verify_payload_signature
 from app.config import settings
 from app.db import get_db
-from app.models import User, UserRole, Evidence, EvidenceVersion, AuditEvent, BlockchainAnchor
-from app.security import hash_password, verify_password, create_access_token, get_current_user
-from app.blockchain import configured as blockchain_configured, anchor_digest, verify_digest
-from pydantic import BaseModel, EmailStr
-app=FastAPI(title="AscentIntegrity API",version="0.1.0",description="Evidence integrity verification, not factual-truth certification.")
-app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(",")],allow_credentials=True,allow_methods=["GET","POST","OPTIONS"],allow_headers=["Authorization","Content-Type"])
+from app.models import AuditEvent, BlockchainAnchor, Evidence, EvidenceVersion, IntegrityCertificate, User, UserRole
+from app.security import (
+    create_access_token,
+    get_current_user,
+    hash_password,
+    verify_password,
+)
+
+app = FastAPI(
+    title="AscentIntegrity API",
+    version="0.1.0",
+    description="Evidence integrity verification, not factual-truth certification.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
-def record(db,actor,action,kind,rid,detail=None):
-    db.add(AuditEvent(actor_id=actor,action=action,resource_type=kind,resource_id=rid,detail=json.dumps(detail or {},sort_keys=True)))
-@app.get("/health")
-def health(): return {"status":"ok","service":"ascentintegrity-api"}
-@app.post("/api/v1/auth/register",status_code=201)
-def register(payload:RegisterIn,db:Session=Depends(get_db)):
-    if settings.app_env!="development" or not settings.allow_dev_registration: raise HTTPException(403,"Development registration disabled")
-    if db.scalar(select(User).where(User.email==payload.email.lower())): raise HTTPException(409,"Email already registered")
-    try: u=User(email=payload.email.lower(),password_hash=hash_password(payload.password),role=UserRole.analyst)
-    except ValueError as e: raise HTTPException(422,str(e))
-    db.add(u);db.flush();record(db,u.id,"user.registered","user",u.id);db.commit()
-    return {"id":u.id,"email":u.email,"role":u.role.value}
-@app.post("/api/v1/auth/token")
-def token(form:OAuth2PasswordRequestForm=Depends(),db:Session=Depends(get_db)):
-    u=db.scalar(select(User).where(User.email==form.username.lower()))
-    if not u or not verify_password(form.password,u.password_hash) or not u.is_active: raise HTTPException(401,"Incorrect email or password")
-    return {"access_token":create_access_token(u.id),"token_type":"bearer"}
-@app.get("/api/v1/auth/me")
-def me(user:User=Depends(get_current_user)): return {"id":user.id,"email":user.email,"role":user.role.value}
-@app.post("/api/v1/evidence",status_code=201)
-async def upload(case_reference:str=Form(...),file:UploadFile=File(...),db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    case_reference=case_reference.strip()
-    if not case_reference or len(case_reference)>100: raise HTTPException(422,"case_reference must be 1-100 characters")
-    data=await file.read(settings.max_upload_bytes+1)
-    if not data: raise HTTPException(422,"Empty files are not accepted")
-    if len(data)>settings.max_upload_bytes: raise HTTPException(413,"Upload exceeds configured size limit")
-    digest=hashlib.sha256(data).hexdigest();key=uuid.uuid4().hex
-    root=Path(settings.storage_root).resolve();root.mkdir(parents=True,exist_ok=True)
-    with (root/key).open("xb") as out: out.write(data)
-    item=Evidence(case_reference=case_reference,filename=Path(file.filename or "evidence.bin").name[:255],media_type=(file.content_type or "application/octet-stream")[:150],byte_size=len(data),sha256=digest,storage_key=key,uploaded_by=user.id)
-    db.add(item);db.flush()
-    db.add(EvidenceVersion(evidence_id=item.id,version_number=1,sha256=digest,byte_size=len(data),storage_key=key,created_by=user.id))
-    record(db,user.id,"evidence.ingested","evidence",item.id,{"sha256":digest,"byte_size":len(data)});db.commit();db.refresh(item)
-    return evidence_out(item)
-def evidence_out(i):
-    return {"id":i.id,"case_reference":i.case_reference,"filename":i.filename,"media_type":i.media_type,"byte_size":i.byte_size,"sha256":i.sha256,"status":i.status,"created_at":i.created_at}
-@app.get("/api/v1/evidence")
-def list_evidence(db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    return [evidence_out(i) for i in db.scalars(select(Evidence).order_by(Evidence.created_at.desc()).limit(200))]
-def get_item(eid,db):
-    item=db.get(Evidence,eid)
-    if not item: raise HTTPException(404,"Evidence not found")
+
+
+class RevokeCertificateIn(BaseModel):
+    reason: str
+
+
+def record(db: Session, actor: str | None, action: str, kind: str, resource_id: str | None, detail=None):
+    db.add(
+        AuditEvent(
+            actor_id=actor,
+            action=action,
+            resource_type=kind,
+            resource_id=resource_id,
+            detail=json.dumps(detail or {}, sort_keys=True),
+        )
+    )
+
+
+def require_writer(user: User) -> None:
+    if user.role not in (UserRole.admin, UserRole.analyst):
+        raise HTTPException(status_code=403, detail="Read-only role cannot modify evidence or issue certificates")
+
+
+def evidence_out(item: Evidence) -> dict:
+    return {
+        "id": item.id,
+        "case_reference": item.case_reference,
+        "filename": item.filename,
+        "media_type": item.media_type,
+        "byte_size": item.byte_size,
+        "sha256": item.sha256,
+        "status": item.status,
+        "created_at": item.created_at,
+    }
+
+
+def get_item(evidence_id: str, db: Session, user: User) -> Evidence:
+    item = db.get(Evidence, evidence_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    # Return the same 404 for another user's record to avoid confirming its existence.
+    if item.uploaded_by != user.id and user.role != UserRole.admin:
+        raise HTTPException(status_code=404, detail="Evidence not found")
     return item
-@app.get("/api/v1/evidence/{evidence_id}")
-def get_evidence(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    return evidence_out(get_item(evidence_id,db))
-@app.post("/api/v1/evidence/{evidence_id}/anchor")
-def anchor_evidence(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    item=get_item(evidence_id,db)
+
+
+def current_stored_hash(item: Evidence) -> str | None:
+    root = Path(settings.storage_root).resolve()
+    path = (root / item.storage_key).resolve()
+    # Internal storage keys are generated by the server. Still enforce containment
+    # in case a database record is corrupted or manually altered.
+    if path.parent != root or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def latest_anchor(db: Session, evidence_id: str) -> BlockchainAnchor | None:
+    return db.scalar(
+        select(BlockchainAnchor)
+        .where(BlockchainAnchor.evidence_id == evidence_id)
+        .order_by(BlockchainAnchor.created_at.desc())
+    )
+
+
+def chain_status(item: Evidence, anchor: BlockchainAnchor | None) -> str:
     if not blockchain_configured():
-        raise HTTPException(503,"Blockchain is not configured. Set RPC URL, deployed contract address and signing key.")
-    existing=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id,BlockchainAnchor.status=="confirmed"))
-    if existing:
-        raise HTTPException(409,"This evidence already has a confirmed anchor; create a new evidence version to anchor a new digest.")
+        return "not_configured"
+    if anchor is None or anchor.status != "confirmed":
+        return "not_anchored"
+    if anchor.sha256 != item.sha256:
+        return "failed"
     try:
-        tx_hash,block_number,confirmed=anchor_digest(item.id,item.sha256)
-        if not confirmed: raise RuntimeError("On-chain read-back verification did not match")
-    except Exception as exc:
-        raise HTTPException(502,"Blockchain anchoring failed; no confirmed anchor was recorded.") from exc
-    anchor=BlockchainAnchor(evidence_id=item.id,sha256=item.sha256,status="confirmed",tx_hash=tx_hash,block_number=block_number)
-    db.add(anchor)
-    record(db,user.id,"evidence.blockchain_anchored","evidence",item.id,{"tx_hash":tx_hash,"block_number":block_number,"sha256":item.sha256})
+        return "confirmed" if verify_digest(item.id, anchor.sha256) else "failed"
+    except Exception:
+        return "unavailable"
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "ascentintegrity-api"}
+
+
+@app.post("/api/v1/auth/register", status_code=201)
+def register(payload: RegisterIn, db: Session = Depends(get_db)):
+    if settings.app_env != "development" or not settings.allow_dev_registration:
+        raise HTTPException(status_code=403, detail="Development registration disabled")
+    if db.scalar(select(User).where(User.email == payload.email.lower())):
+        raise HTTPException(status_code=409, detail="Email already registered")
+    try:
+        user = User(
+            email=payload.email.lower(),
+            password_hash=hash_password(payload.password),
+            role=UserRole.analyst,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    db.add(user)
+    db.flush()
+    record(db, user.id, "user.registered", "user", user.id)
     db.commit()
-    return {"evidence_id":item.id,"sha256":item.sha256,"status":"confirmed","tx_hash":tx_hash,"block_number":block_number,"statement":"The configured chain accepted this digest. This does not prove factual truth or lawful provenance."}
+    return {"id": user.id, "email": user.email, "role": user.role.value}
+
+
+@app.post("/api/v1/auth/token")
+def token(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == form.username.lower()))
+    if not user or not verify_password(form.password, user.password_hash) or not user.is_active:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    return {"access_token": create_access_token(user.id), "token_type": "bearer"}
+
+
+@app.get("/api/v1/auth/me")
+def me(user: User = Depends(get_current_user)):
+    return {"id": user.id, "email": user.email, "role": user.role.value}
+
+
+@app.post("/api/v1/evidence", status_code=201)
+async def upload(
+    case_reference: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_writer(user)
+    case_reference = case_reference.strip()
+    if not case_reference or len(case_reference) > 100:
+        raise HTTPException(status_code=422, detail="case_reference must be 1-100 characters")
+
+    data = await file.read(settings.max_upload_bytes + 1)
+    if not data:
+        raise HTTPException(status_code=422, detail="Empty files are not accepted")
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
+
+    digest = hashlib.sha256(data).hexdigest()
+    key = uuid.uuid4().hex
+    root = Path(settings.storage_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    storage_path = root / key
+
+    storage_created = False
+    try:
+        with storage_path.open("xb") as output:
+            storage_created = True
+            output.write(data)
+        item = Evidence(
+            case_reference=case_reference,
+            filename=Path(file.filename or "evidence.bin").name[:255],
+            media_type=(file.content_type or "application/octet-stream")[:150],
+            byte_size=len(data),
+            sha256=digest,
+            storage_key=key,
+            uploaded_by=user.id,
+        )
+        db.add(item)
+        db.flush()
+        db.add(
+            EvidenceVersion(
+                evidence_id=item.id,
+                version_number=1,
+                sha256=digest,
+                byte_size=len(data),
+                storage_key=key,
+                created_by=user.id,
+            )
+        )
+        record(
+            db,
+            user.id,
+            "evidence.ingested",
+            "evidence",
+            item.id,
+            {"sha256": digest, "byte_size": len(data)},
+        )
+        db.commit()
+        db.refresh(item)
+        return evidence_out(item)
+    except Exception:
+        db.rollback()
+        if storage_created:
+            storage_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+
+@app.get("/api/v1/evidence")
+def list_evidence(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    query = select(Evidence).order_by(Evidence.created_at.desc()).limit(200)
+    if user.role != UserRole.admin:
+        query = query.where(Evidence.uploaded_by == user.id)
+    return [evidence_out(item) for item in db.scalars(query)]
+
+
+@app.get("/api/v1/evidence/{evidence_id}")
+def get_evidence(
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return evidence_out(get_item(evidence_id, db, user))
+
+
+@app.post("/api/v1/evidence/{evidence_id}/anchor")
+def anchor_evidence(
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_writer(user)
+    item = get_item(evidence_id, db, user)
+    if not blockchain_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Blockchain is not configured. Set RPC URL, deployed contract address and signing key.",
+        )
+    existing = db.scalar(
+        select(BlockchainAnchor).where(
+            BlockchainAnchor.evidence_id == item.id,
+            BlockchainAnchor.status == "confirmed",
+        )
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="This evidence already has a confirmed anchor; create a new evidence version to anchor a new digest.",
+        )
+    try:
+        tx_hash, block_number, confirmed = anchor_digest(item.id, item.sha256)
+        if not confirmed:
+            raise RuntimeError("On-chain read-back verification did not match")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Blockchain anchoring failed; no confirmed anchor was recorded.",
+        ) from exc
+
+    anchor = BlockchainAnchor(
+        evidence_id=item.id,
+        sha256=item.sha256,
+        status="confirmed",
+        tx_hash=tx_hash,
+        block_number=block_number,
+    )
+    db.add(anchor)
+    record(
+        db,
+        user.id,
+        "evidence.blockchain_anchored",
+        "evidence",
+        item.id,
+        {"tx_hash": tx_hash, "block_number": block_number, "sha256": item.sha256},
+    )
+    db.commit()
+    return {
+        "evidence_id": item.id,
+        "sha256": item.sha256,
+        "status": "confirmed",
+        "tx_hash": tx_hash,
+        "block_number": block_number,
+        "statement": "The configured chain accepted this digest. This does not prove factual truth or lawful provenance.",
+    }
+
+
 @app.post("/api/v1/evidence/{evidence_id}/verify")
-def verify(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    item=get_item(evidence_id,db);path=Path(settings.storage_root).resolve()/item.storage_key
-    observed=hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-    integrity="VERIFIED" if observed==item.sha256 else "FAILED"
-    anchor=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id).order_by(BlockchainAnchor.created_at.desc()))
-    chain="not_configured"
-    if blockchain_configured() and anchor:
-        try:
-            chain="confirmed" if verify_digest(item.id,anchor.sha256) and anchor.sha256==item.sha256 else "failed"
-        except Exception:
-            chain="unavailable"
-    cert="VERIFIED" if integrity=="VERIFIED" and chain=="confirmed" else ("FAILED" if integrity=="FAILED" or chain=="failed" else "INCOMPLETE")
-    record(db,user.id,"evidence.verified","evidence",item.id,{"integrity":integrity,"blockchain":chain});db.commit()
-    return {"evidence_id":item.id,"recorded_sha256":item.sha256,"observed_sha256":observed,"integrity_status":integrity,"blockchain_status":chain,"certificate_status":cert,"statement":"Byte-level integrity checks do not establish factual truth, authorship, lawful collection, or admissibility."}
+def verify(
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = get_item(evidence_id, db, user)
+    observed = current_stored_hash(item)
+    integrity = "VERIFIED" if observed == item.sha256 else "FAILED"
+    anchor = latest_anchor(db, item.id)
+    chain = chain_status(item, anchor)
+    certificate_status = (
+        "VERIFIED"
+        if integrity == "VERIFIED" and chain == "confirmed"
+        else "FAILED"
+        if integrity == "FAILED" or chain == "failed"
+        else "INCOMPLETE"
+    )
+    record(
+        db,
+        user.id,
+        "evidence.verified",
+        "evidence",
+        item.id,
+        {"integrity": integrity, "blockchain": chain},
+    )
+    db.commit()
+    return {
+        "evidence_id": item.id,
+        "recorded_sha256": item.sha256,
+        "observed_sha256": observed,
+        "integrity_status": integrity,
+        "blockchain_status": chain,
+        "certificate_status": certificate_status,
+        "statement": "Byte-level integrity checks do not establish factual truth, authorship, lawful collection, or admissibility.",
+    }
+
+
+def certificate_out(certificate: IntegrityCertificate) -> dict:
+    payload = json.loads(certificate.payload_json)
+    signature_valid = verify_payload_signature(
+        payload,
+        certificate.signature,
+        certificate.public_key_pem,
+    )
+    return {
+        "payload": payload,
+        "signature": certificate.signature,
+        "signature_algorithm": certificate.signature_algorithm,
+        "signing_key_id": certificate.signing_key_id,
+        "public_key_pem": certificate.public_key_pem,
+        "signature_valid": signature_valid,
+        "key_trust_note": "The signature verifies against the included public key. Independently trust the issuer by validating the key fingerprint through a trusted channel.",
+        "revocation": {
+            "status": certificate.status,
+            "revoked_at": certificate.revoked_at,
+            "reason": certificate.revocation_reason,
+        },
+    }
+
+
 @app.get("/api/v1/evidence/{evidence_id}/certificate")
-def certificate(evidence_id:str,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    item=get_item(evidence_id,db);path=Path(settings.storage_root).resolve()/item.storage_key
-    observed=hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-    anchor=db.scalar(select(BlockchainAnchor).where(BlockchainAnchor.evidence_id==item.id).order_by(BlockchainAnchor.created_at.desc()))
-    chain="not_configured"
-    if blockchain_configured() and anchor:
-        try:
-            chain="confirmed" if verify_digest(item.id,anchor.sha256) and anchor.sha256==item.sha256 else "failed"
-        except Exception:
-            chain="unavailable"
-    if observed!=item.sha256: raise HTTPException(409,"Certificate unavailable: integrity verification failed")
-    if chain!="confirmed": raise HTTPException(409,f"Certificate unavailable: blockchain verification status is {chain}")
-    now=datetime.now(timezone.utc);cid=str(uuid.uuid4())
-    record(db,user.id,"certificate.issued","evidence",item.id,{"sha256":item.sha256});db.commit()
-    return {"certificate_id":cid,"evidence_id":item.id,"sha256":item.sha256,"issued_at":now,"status":"VERIFIED","statement":"Integrity checks passed for this evidence version at issuance time. This is not factual-truth certification.","checks":{"sha256":"passed","stored_object":"matched","blockchain_anchor":"confirmed"}}
+def get_certificate(
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    item = get_item(evidence_id, db, user)
+    certificate = db.scalar(
+        select(IntegrityCertificate)
+        .where(
+            IntegrityCertificate.evidence_id == item.id,
+            IntegrityCertificate.sha256 == item.sha256,
+        )
+        .order_by(IntegrityCertificate.created_at.desc())
+    )
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="No certificate has been issued for this evidence version")
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/evidence/{evidence_id}/certificate", status_code=201)
+def issue_certificate(
+    evidence_id: str,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_writer(user)
+    item = get_item(evidence_id, db, user)
+    observed = current_stored_hash(item)
+    anchor = latest_anchor(db, item.id)
+    chain = chain_status(item, anchor)
+
+    if observed != item.sha256:
+        raise HTTPException(status_code=409, detail="Certificate unavailable: integrity verification failed")
+    if chain != "confirmed" or anchor is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Certificate unavailable: blockchain verification status is {chain}",
+        )
+
+    existing = db.scalar(
+        select(IntegrityCertificate).where(
+            IntegrityCertificate.evidence_id == item.id,
+            IntegrityCertificate.sha256 == item.sha256,
+        )
+    )
+    if existing is not None:
+        if existing.status == "REVOKED":
+            raise HTTPException(status_code=409, detail="This certificate was revoked; a new evidence version is required")
+        response.status_code = 200
+        return certificate_out(existing)
+
+    issued_at = datetime.now(timezone.utc)
+    certificate_id = str(uuid.uuid4())
+    payload = {
+        "certificate_id": certificate_id,
+        "schema_version": 1,
+        "product": "AscentIntegrity",
+        "certificate_type": "document_integrity",
+        "evidence_id": item.id,
+        "sha256": item.sha256,
+        "issuer_id": user.id,
+        "issued_at": issued_at.isoformat(),
+        "status": "ISSUED",
+        "blockchain": {
+            "status": "confirmed",
+            "transaction_hash": anchor.tx_hash,
+            "block_number": anchor.block_number,
+            "digest": anchor.sha256,
+        },
+        "statement": (
+            "Defined document-integrity checks passed at issuance time. "
+            "This certificate does not prove factual truth, authorship, lawful collection, "
+            "institutional legitimacy, or legal admissibility."
+        ),
+    }
+
+    try:
+        signature, public_key_pem, key_id = sign_payload(payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Certificate signing is unavailable. Configure a valid Ed25519 signing key.",
+        ) from exc
+
+    if not verify_payload_signature(payload, signature, public_key_pem):
+        raise HTTPException(status_code=500, detail="Certificate signature self-check failed")
+
+    certificate = IntegrityCertificate(
+        id=certificate_id,
+        evidence_id=item.id,
+        sha256=item.sha256,
+        issuer_id=user.id,
+        schema_version=1,
+        payload_json=json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        signature=signature,
+        signature_algorithm="Ed25519",
+        signing_key_id=key_id,
+        public_key_pem=public_key_pem,
+        status="ISSUED",
+        created_at=issued_at,
+    )
+    db.add(certificate)
+    record(
+        db,
+        user.id,
+        "certificate.issued",
+        "certificate",
+        certificate_id,
+        {"evidence_id": item.id, "sha256": item.sha256, "signing_key_id": key_id},
+    )
+    try:
+        db.commit()
+        db.refresh(certificate)
+    except IntegrityError:
+        db.rollback()
+        # A concurrent retry may have issued the same evidence/digest certificate.
+        existing = db.scalar(
+            select(IntegrityCertificate).where(
+                IntegrityCertificate.evidence_id == item.id,
+                IntegrityCertificate.sha256 == item.sha256,
+            )
+        )
+        if existing is None:
+            raise HTTPException(status_code=409, detail="Certificate issuance conflicted; retry safely")
+        response.status_code = 200
+        return certificate_out(existing)
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/certificates/{certificate_id}/revoke")
+def revoke_certificate(
+    certificate_id: str,
+    payload: RevokeCertificateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_writer(user)
+    reason = payload.reason.strip()
+    if not reason or len(reason) > 500:
+        raise HTTPException(status_code=422, detail="Revocation reason must be 1-500 characters")
+
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    item = get_item(certificate.evidence_id, db, user)
+    if certificate.issuer_id != user.id and user.role != UserRole.admin:
+        raise HTTPException(status_code=403, detail="Only the issuing user or an administrator can revoke this certificate")
+    if certificate.status == "REVOKED":
+        return certificate_out(certificate)
+
+    certificate.status = "REVOKED"
+    certificate.revoked_at = datetime.now(timezone.utc)
+    certificate.revocation_reason = reason
+    record(
+        db,
+        user.id,
+        "certificate.revoked",
+        "certificate",
+        certificate.id,
+        {"evidence_id": item.id, "reason": reason},
+    )
+    db.commit()
+    db.refresh(certificate)
+    return certificate_out(certificate)
+
+
+@app.get("/api/v1/public/certificates/{certificate_id}")
+def get_public_certificate(certificate_id: str, db: Session = Depends(get_db)):
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    return certificate_out(certificate)
+
+
+@app.post("/api/v1/public/certificates/{certificate_id}/verify")
+async def verify_public_certificate(
+    certificate_id: str,
+    file: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+):
+    certificate = db.get(IntegrityCertificate, certificate_id)
+    if certificate is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+
+    payload = json.loads(certificate.payload_json)
+    signature_valid = verify_payload_signature(
+        payload,
+        certificate.signature,
+        certificate.public_key_pem,
+    )
+    item = db.get(Evidence, certificate.evidence_id)
+    observed_stored_hash = current_stored_hash(item) if item is not None else None
+    anchor = latest_anchor(db, certificate.evidence_id) if item is not None else None
+    chain = chain_status(item, anchor) if item is not None else "unavailable"
+
+    submitted_hash = None
+    if file is not None:
+        data = await file.read(settings.max_upload_bytes + 1)
+        await file.close()
+        if len(data) > settings.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty files are not accepted")
+        submitted_hash = hashlib.sha256(data).hexdigest()
+
+    if certificate.status == "REVOKED":
+        status = "REVOKED"
+    elif not signature_valid:
+        status = "INVALID"
+    elif observed_stored_hash != certificate.sha256:
+        status = "UNVERIFIABLE" if observed_stored_hash is None else "INVALID"
+    elif submitted_hash is not None and submitted_hash != certificate.sha256:
+        status = "DOCUMENT_MISMATCH"
+    elif chain != "confirmed":
+        status = "PENDING" if chain == "not_anchored" else "UNVERIFIABLE"
+    else:
+        status = "VERIFIED"
+
+    record(
+        db,
+        None,
+        "certificate.public_verification",
+        "certificate",
+        certificate.id,
+        {"status": status, "document_supplied": submitted_hash is not None},
+    )
+    db.commit()
+    return {
+        "certificate_id": certificate.id,
+        "status": status,
+        "signature_valid": signature_valid,
+        "stored_document_integrity": "matched" if observed_stored_hash == certificate.sha256 else "unavailable_or_mismatched",
+        "blockchain_status": chain,
+        "submitted_document_match": (
+            submitted_hash == certificate.sha256 if submitted_hash is not None else None
+        ),
+        "statement": (
+            "VERIFIED means the certificate signature, stored evidence digest, and required blockchain anchor passed. "
+            "A submitted document is compared only when one is provided. This result does not establish factual truth "
+            "or legal validity. Trust the issuer key through a separate trusted channel."
+        ),
+    }
+
+
 @app.get("/api/v1/audit")
-def audit(limit:int=100,db:Session=Depends(get_db),user:User=Depends(get_current_user)):
-    if user.role not in (UserRole.admin,UserRole.analyst): raise HTTPException(403,"Insufficient role")
-    return [{"id":e.id,"actor_id":e.actor_id,"action":e.action,"resource_type":e.resource_type,"resource_id":e.resource_id,"detail":e.detail,"created_at":e.created_at} for e in db.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(max(1,min(limit,500))))]
+def audit(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if user.role not in (UserRole.admin, UserRole.analyst):
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    return [
+        {
+            "id": event.id,
+            "actor_id": event.actor_id,
+            "action": event.action,
+            "resource_type": event.resource_type,
+            "resource_id": event.resource_id,
+            "detail": event.detail,
+            "created_at": event.created_at,
+        }
+        for event in db.scalars(
+            select(AuditEvent)
+            .order_by(AuditEvent.created_at.desc())
+            .limit(max(1, min(limit, 500)))
+        )
+    ]

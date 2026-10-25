@@ -11,5 +11,7 @@ class Settings(BaseSettings):
     blockchain_rpc_url: str = ""
     blockchain_contract_address: str = ""
     blockchain_private_key: str = ""
+    certificate_signing_private_key: str = ""
+    certificate_signing_key_id: str = "ascent-dev-ed25519-1"
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 settings = Settings()
